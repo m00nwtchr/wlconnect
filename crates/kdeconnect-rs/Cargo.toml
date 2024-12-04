@@ -1,0 +1,30 @@
+[package]
+name = "kdeconnect"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Implementation of the KDE Connect protocol in Rust."
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+async-trait.workspace = true
+
+event-listener = "5.3"
+mdns-sd = { version = "0.12", default-features = false, features = ["async"] }
+
+time.workspace = true
+
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
+
+rcgen = "0.13"
+x509-parser = "0.16"
+sha2 = "0.10"
+hex = "0.4"
