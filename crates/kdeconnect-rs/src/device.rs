@@ -125,6 +125,7 @@ pub struct DeviceConfig {
 }
 
 impl DeviceConfig {
+	#[must_use]
 	pub fn is_paired(&self) -> bool {
 		self.certificate.is_some()
 	}
@@ -488,8 +489,7 @@ impl Device {
 											&& url.starts_with("file://") && player_info
 											.album_art_url
 											.as_ref()
-											.map(|x| *x == url)
-											.unwrap_or(false)
+											.is_some_and(|x| *x == url)
 										{
 											let server_conf = self.server_config.clone();
 											let ret = async {
@@ -630,10 +630,9 @@ impl DeviceClient {
 	) -> Self {
 		Self {
 			client_w,
-
 			initiated_pair,
-			pair_event,
 			server_config,
+			pair_event,
 		}
 	}
 

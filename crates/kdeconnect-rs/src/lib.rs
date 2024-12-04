@@ -1,27 +1,17 @@
 #![feature(once_cell_try, let_chains, duration_constructors)]
 #![warn(clippy::pedantic)]
 
-pub mod config;
-pub mod device;
-pub mod packets;
-mod util;
-
 use std::{
 	collections::HashMap,
-	io,
-	net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+	net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 	sync::Arc,
 	time::Duration,
 };
 
-use config::ConfigProvider;
-use device::{create_device, Device, DeviceClient};
 use log::{debug, error, info};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use packets::{DeviceType, Identity, Packet, PacketType, PROTOCOL_VERSION};
 use rcgen::KeyPair;
 use serde_json as json;
-use thiserror::Error;
 use tokio::{
 	io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
 	net::{TcpListener, TcpStream, UdpSocket},
@@ -38,63 +28,23 @@ use tokio_rustls::{
 	TlsAcceptor, TlsConnector,
 };
 use tokio_stream::{wrappers::UnboundedReceiverStream, Stream};
+
+pub mod config;
+pub mod device;
+pub mod error;
+pub mod packets;
+mod util;
+
+use config::ConfigProvider;
+use device::{create_device, Device, DeviceClient};
+use error::KdeConnectError;
+use packets::{DeviceType, Identity, Packet, PacketType, PROTOCOL_VERSION};
 use util::NoCertificateVerification;
-
-#[derive(Error, Debug)]
-pub enum KdeConnectError {
-	#[error(transparent)]
-	Io(#[from] io::Error),
-	#[error(transparent)]
-	Mdns(#[from] mdns_sd::Error),
-	#[error(transparent)]
-	Rcgen(#[from] rcgen::Error),
-	#[error(transparent)]
-	Rustls(#[from] tokio_rustls::rustls::Error),
-	#[error(transparent)]
-	InvalidDnsName(#[from] tokio_rustls::rustls::pki_types::InvalidDnsNameError),
-	#[error(transparent)]
-	SerdeJson(#[from] serde_json::Error),
-	#[error(transparent)]
-	X509(#[from] x509_parser::nom::Err<x509_parser::error::X509Error>),
-	#[error("Channel send error")]
-	ChannelSendError,
-	#[error("Channel recieve error")]
-	ChannelRecvError,
-	#[error("No peer certificates")]
-	NoPeerCerts,
-	#[error("Server task already started")]
-	ServerAlreadyStarted,
-	#[error("Failed to convert OsString to str")]
-	OsStringConversionError,
-	#[error("Failed to find port for payload transfer")]
-	NoPayloadTransferPortFound,
-	#[error("No filename")]
-	NoFileName,
-	#[error("Other")]
-	Other,
-
-	#[error("Device rejected pair")]
-	DeviceRejectedPair,
-	#[error("Already paired")]
-	DeviceAlreadyPaired,
-}
-
-impl<T> From<mpsc::error::SendError<T>> for KdeConnectError {
-	fn from(_: mpsc::error::SendError<T>) -> Self {
-		Self::ChannelSendError
-	}
-}
-
-impl From<oneshot::error::RecvError> for KdeConnectError {
-	fn from(_: oneshot::error::RecvError) -> Self {
-		Self::ChannelRecvError
-	}
-}
-
-type Result<T> = std::result::Result<T, KdeConnectError>;
 
 const KDECONNECT_PORT: u16 = 1716;
 const SOCKET_ADDR: SocketAddrV6 = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, KDECONNECT_PORT, 0, 0);
+
+type Result<T> = std::result::Result<T, KdeConnectError>;
 
 enum KdeConnectAction {
 	BroadcastIdentity(oneshot::Sender<Result<()>>),
@@ -136,26 +86,24 @@ impl KdeConnect {
 		udp_socket.set_broadcast(true)?;
 		let mdns = ServiceDaemon::new()?;
 
-		let keypair = match config
+		let keypair = if let Ok(pair) = config
 			.retrieve_server_keypair()
 			.await
-			.and_then(|x| KeyPair::try_from(x).map_err(|x| x.into()))
+			.and_then(|x| KeyPair::try_from(x).map_err(std::convert::Into::into))
 		{
-			Ok(pair) => pair,
-			Err(_) => {
-				let pair = KeyPair::generate()?;
-				config.store_server_keypair(&pair.serialize_der()).await?;
-				pair
-			}
+			pair
+		} else {
+			let pair = KeyPair::generate()?;
+			config.store_server_keypair(&pair.serialize_der()).await?;
+			pair
 		};
 
-		let cert = match config.retrieve_server_cert().await {
-			Ok(cert) => CertificateDer::from(cert),
-			Err(_) => {
-				let cert = util::generate_server_cert(&keypair, &device_id)?;
-				config.store_server_cert(cert.der()).await?;
-				CertificateDer::from(cert)
-			}
+		let cert = if let Ok(cert) = config.retrieve_server_cert().await {
+			CertificateDer::from(cert)
+		} else {
+			let cert = util::generate_server_cert(&keypair, &device_id)?;
+			config.store_server_cert(cert.der()).await?;
+			CertificateDer::from(cert)
 		};
 
 		let verifier = Arc::new(NoCertificateVerification::new(default_provider()));
@@ -234,7 +182,7 @@ impl KdeConnect {
 			x = self.send_on_udp() => x,
 			x = self.listen_on_tcp() => x,
 			x = self.discover_mdns() => x,
-			_ = self.respond_to_client() => Ok(()),
+			() = self.respond_to_client() => Ok(()),
 		};
 		self.mdns.unregister(&fullname)?;
 		info!("unpublished mdns service");
@@ -402,16 +350,18 @@ impl KdeConnect {
 
 	async fn publish_mdns(&self) -> Result<String> {
 		let mut props = HashMap::new();
+
 		props.insert("id".to_string(), self.device_id.clone());
 		props.insert("name".to_string(), self.device_name.clone());
 		props.insert("type".to_string(), self.device_type.to_string());
 		props.insert("protocol".to_string(), PROTOCOL_VERSION.to_string());
+
 		// local_ip_addr correctly pulls in the ip address for ios
 		let conf = ServiceInfo::new(
 			"_kdeconnect._udp.local.",
 			&self.device_id,
 			&self.device_id,
-			"",
+			IpAddr::V6(Ipv6Addr::UNSPECIFIED),
 			// local_ip_addr::get_local_ip_address()
 			// 	.map_or(vec![], |x| vec![x])
 			// 	.as_slice(),
@@ -419,6 +369,7 @@ impl KdeConnect {
 			props,
 		)?
 		.enable_addr_auto();
+
 		let fullname = conf.get_fullname().to_string();
 		self.mdns.register(conf)?;
 		Ok(fullname)

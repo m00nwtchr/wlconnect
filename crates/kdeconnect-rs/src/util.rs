@@ -182,11 +182,11 @@ pub(crate) async fn create_payload(
 			if let Ok(incoming) = free_listener.accept().await
 				&& let Ok(mut stream) = TlsAcceptor::from(server_config).accept(incoming.0).await
 				&& let Ok(_) = tokio::io::copy(&mut payload, &mut stream).await
-				&& let Ok(_) = stream.flush().await
+				&& let Ok(()) = stream.flush().await
 			{
 				let _ = stream.shutdown().await;
 			}
-			info!("successfully sent payload on port {}", free_port)
+			info!("successfully sent payload on port {}", free_port);
 		}))
 	} else {
 		Err(KdeConnectError::NoPayloadTransferPortFound)

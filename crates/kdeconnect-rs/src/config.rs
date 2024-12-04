@@ -1,12 +1,13 @@
-use crate::{device::DeviceConfig, KdeConnectError, Result};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde_json as json;
-use std::path::PathBuf;
 use tokio::{
 	fs::{create_dir_all, read_dir, File},
 	io::AsyncWriteExt,
 };
+
+use crate::{device::DeviceConfig, KdeConnectError, Result};
 
 #[async_trait]
 pub trait ConfigProvider {
