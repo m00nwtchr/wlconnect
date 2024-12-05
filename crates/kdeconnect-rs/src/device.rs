@@ -35,7 +35,7 @@ use crate::{
 	make_packet, make_packet_payload, make_packet_str, make_packet_str_payload,
 	packets::{
 		Battery, BatteryRequest, Clipboard, ClipboardConnect, ConnectivityReport,
-		ConnectivityReportRequest, DeviceType, FindPhone, Identity, MousepadEcho,
+		ConnectivityReportRequest, DeviceType, FindMyPhone, Identity, MousepadEcho,
 		MousepadKeyboardState, MousepadRequest, Mpris, MprisPlayer, MprisRequest,
 		MprisRequestAction, Packet, PacketPayloadTransferInfo, PacketType, Pair, Ping, Presenter,
 		RunCommand, RunCommandItem, RunCommandRequest, ShareRequest, ShareRequestFile,
@@ -260,12 +260,13 @@ impl Device {
 		&mut self,
 		handler: &mut Box<dyn DeviceHandler + Sync + Send>,
 	) -> Result<()> {
-		while let Some(evt) = select! {
+		while let Some(event) = select! {
 			x = self.stream_r.next_line() => x?.map(DeviceEvent::Stream),
 			x = self.client_r.recv() => x.map(DeviceEvent::Client),
 		} {
-			match evt {
+			match event {
 				DeviceEvent::Stream(buf) => {
+					// info!("packet: {}", buf);
 					let packet: Packet = json::from_str(&buf)?;
 
 					match packet.packet_type.as_str() {
@@ -357,7 +358,7 @@ impl Device {
 								handler.handle_clipboard_content(connect.content).await;
 							}
 						}
-						FindPhone::TYPE => {
+						FindMyPhone::TYPE => {
 							handler.handle_find_phone().await;
 						}
 						ConnectivityReport::TYPE => {
@@ -403,17 +404,16 @@ impl Device {
 								} else {
 									json::from_value(packet.body)?
 								};
-							if let Some(transfer_info) = packet.payload_transfer_info
-								&& let Some(size) = packet.payload_size
+							if let Some(payload) = packet.payload
 								&& let ShareRequest::File(file) = request
 							{
 								handler
 									.handle_file_share(
 										file,
-										size,
+										payload.size,
 										get_payload(
 											self.ip,
-											transfer_info,
+											payload.transfer_info,
 											self.client_config.clone(),
 										)
 										.await?,
@@ -446,15 +446,14 @@ impl Device {
 									album_art_url: _,
 									transferring_album_art,
 								} => {
-									if transferring_album_art
-										&& let Some(transfer_info) = packet.payload_transfer_info
+									if transferring_album_art && let Some(payload) = packet.payload
 									{
 										handler
 											.handle_mpris_player_album_art(
 												player,
 												get_payload(
 													self.ip,
-													transfer_info,
+													payload.transfer_info,
 													self.client_config.clone(),
 												)
 												.await?,
@@ -750,7 +749,7 @@ impl DeviceClient {
 	}
 
 	pub async fn toggle_find_phone(&self) -> Result<()> {
-		let packet = FindPhone {};
+		let packet = FindMyPhone {};
 		self.send_packet(make_packet_str!(packet)?).await
 	}
 

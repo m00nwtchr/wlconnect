@@ -3,21 +3,18 @@
 
 use std::{
 	collections::HashMap,
-	net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+	net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
 	sync::Arc,
-	time::Duration,
 };
 
 use log::{debug, error, info};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use rcgen::KeyPair;
-use serde_json as json;
 use tokio::{
 	io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
 	net::{TcpListener, TcpStream, UdpSocket},
 	select,
 	sync::{mpsc, oneshot, Mutex},
-	time::{interval, sleep, MissedTickBehavior},
 };
 use tokio_rustls::{
 	rustls::{
@@ -38,26 +35,40 @@ mod util;
 use config::ConfigProvider;
 use device::{create_device, Device, DeviceClient};
 use error::KdeConnectError;
-use packets::{DeviceType, Identity, Packet, PacketType, PROTOCOL_VERSION};
+use packets::{DeviceType, Identity as IdentityPacket, Packet, PacketType, PROTOCOL_VERSION};
 use util::NoCertificateVerification;
 
 const KDECONNECT_PORT: u16 = 1716;
 const SOCKET_ADDR: SocketAddrV6 = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, KDECONNECT_PORT, 0, 0);
+const SERVICE: &str = "_kdeconnect._udp.local.";
 
 type Result<T> = std::result::Result<T, KdeConnectError>;
 
-enum KdeConnectAction {
-	BroadcastIdentity(oneshot::Sender<Result<()>>),
-}
-
-pub struct KdeConnect {
+pub struct Identity {
 	pub device_type: DeviceType,
 	pub device_name: String,
 	pub device_id: String,
 	pub device_incoming_capabilities: Vec<String>,
 	pub device_outgoing_capabilities: Vec<String>,
+}
 
-	udp_socket: UdpSocket,
+impl Identity {
+	fn to_packet(&self, tcp_port: Option<u16>) -> IdentityPacket {
+		IdentityPacket {
+			device_id: self.device_id.clone(),
+			device_name: self.device_name.clone(),
+			device_type: self.device_type,
+			protocol_version: PROTOCOL_VERSION,
+			incoming_capabilities: self.device_incoming_capabilities.clone(),
+			outgoing_capabilities: self.device_outgoing_capabilities.clone(),
+			tcp_port,
+		}
+	}
+}
+
+pub struct KdeConnect {
+	pub identity: Identity,
+
 	mdns: ServiceDaemon,
 	server_tls_config: Arc<ServerConfig>,
 	client_tls_config: Arc<ClientConfig>,
@@ -82,8 +93,6 @@ impl KdeConnect {
 		KdeConnectClient,
 		impl Stream<Item = (Device, DeviceClient)>,
 	)> {
-		let udp_socket = UdpSocket::bind(SOCKET_ADDR).await?;
-		udp_socket.set_broadcast(true)?;
 		let mdns = ServiceDaemon::new()?;
 
 		let keypair = if let Ok(pair) = config
@@ -139,13 +148,14 @@ impl KdeConnect {
 
 		Ok((
 			Self {
-				device_id,
-				device_name,
-				device_type,
-				device_incoming_capabilities: incoming_caps,
-				device_outgoing_capabilities: outgoing_caps,
+				identity: Identity {
+					device_id,
+					device_name,
+					device_type,
+					device_incoming_capabilities: incoming_caps,
+					device_outgoing_capabilities: outgoing_caps,
+				},
 
-				udp_socket,
 				mdns,
 				config,
 				server_tls_config,
@@ -161,53 +171,34 @@ impl KdeConnect {
 		))
 	}
 
-	fn make_identity(&self, tcp_port: Option<u16>) -> Packet {
-		let ident = Identity {
-			device_id: self.device_id.clone(),
-			device_name: self.device_name.clone(),
-			device_type: self.device_type,
-			protocol_version: PROTOCOL_VERSION,
-			incoming_capabilities: self.device_incoming_capabilities.clone(),
-			outgoing_capabilities: self.device_outgoing_capabilities.clone(),
-			tcp_port,
-		};
-		make_packet!(ident)
-	}
-
 	pub async fn start_server(&self) -> Result<()> {
 		let fullname = self.publish_mdns().await?;
 		info!("published mdns service");
+
 		let ret = select! {
 			x = self.listen_on_udp() => x,
-			x = self.send_on_udp() => x,
 			x = self.listen_on_tcp() => x,
 			x = self.discover_mdns() => x,
 			() = self.respond_to_client() => Ok(()),
 		};
+
 		self.mdns.unregister(&fullname)?;
 		info!("unpublished mdns service");
 		ret
 	}
 
-	async fn respond_to_client(&self) {
-		while let Some(evt) = self.client_rx.lock().await.recv().await {
-			use KdeConnectAction as A;
-			let _ = match evt {
-				A::BroadcastIdentity(respond) => respond.send(self.send_identity_once().await),
-			};
-		}
-	}
-
 	async fn listen_on_tcp(&self) -> Result<()> {
 		let tcp_listener = TcpListener::bind(SOCKET_ADDR).await?;
-
 		info!("listening on tcp");
+
 		while let Ok((stream, _)) = tcp_listener.accept().await {
 			let mut stream = BufReader::new(stream);
+
 			let mut identity = String::new();
 			stream.read_line(&mut identity).await?;
-			if let Ok(packet) = json::from_str::<Packet>(&identity)
-				&& let Ok(identity) = json::from_value::<Identity>(packet.body)
+
+			if let Ok(packet) = serde_json::from_str::<Packet>(&identity)
+				&& let Ok(identity) = serde_json::from_value::<IdentityPacket>(packet.body)
 			{
 				if self
 					.connected_clients
@@ -259,14 +250,17 @@ impl KdeConnect {
 	}
 
 	async fn listen_on_udp(&self) -> Result<()> {
+		let udp_socket = UdpSocket::bind(SOCKET_ADDR).await?;
 		info!("listening on udp");
+
 		loop {
 			let mut buf = vec![0u8; 8192];
 
-			let (len, mut addr) = self.udp_socket.recv_from(&mut buf).await?;
-			let packet: Packet = json::from_slice(&buf[..len])?;
-			if let Ok(identity) = json::from_value::<Identity>(packet.body)
-				&& identity.device_id != self.device_id
+			let (len, mut addr) = udp_socket.recv_from(&mut buf).await?;
+			let packet: Packet = serde_json::from_slice(&buf[..len])?;
+
+			if let Ok(identity) = serde_json::from_value::<IdentityPacket>(packet.body)
+				&& identity.device_id != self.identity.device_id
 				&& let Some(tcp_port) = identity.tcp_port
 			{
 				if self
@@ -290,7 +284,7 @@ impl KdeConnect {
 						.push(identity.device_id.clone());
 
 					let mut stream = BufReader::new(TcpStream::connect(addr).await?);
-					let own_identity = json::to_string(&self.make_identity(None))? + "\n";
+					let own_identity = serde_json::to_string(&self.make_identity(None))? + "\n";
 					stream.write_all(own_identity.as_bytes()).await?;
 
 					let stream = TlsAcceptor::from(self.server_tls_config.clone())
@@ -325,46 +319,19 @@ impl KdeConnect {
 		}
 	}
 
-	async fn send_identity_once(&self) -> Result<()> {
-		self.udp_socket
-			.send_to(
-				&json::to_vec(&self.make_identity(Some(KDECONNECT_PORT)))?,
-				SocketAddrV4::new(Ipv4Addr::BROADCAST, KDECONNECT_PORT),
-			)
-			.await?;
-		debug!("broadcasted identity over udp");
-		Ok(())
-	}
-
-	async fn send_on_udp(&self) -> Result<()> {
-		info!("broadcasting on udp");
-		// wait until everything else is ready
-		sleep(Duration::from_secs(1)).await;
-		let mut interval = interval(Duration::from_secs(30));
-		interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-		loop {
-			self.send_identity_once().await?;
-			interval.tick().await;
-		}
-	}
-
 	async fn publish_mdns(&self) -> Result<String> {
 		let mut props = HashMap::new();
 
-		props.insert("id".to_string(), self.device_id.clone());
-		props.insert("name".to_string(), self.device_name.clone());
-		props.insert("type".to_string(), self.device_type.to_string());
+		props.insert("id".to_string(), self.identity.device_id.clone());
+		props.insert("name".to_string(), self.identity.device_name.clone());
+		props.insert("type".to_string(), self.identity.device_type.to_string());
 		props.insert("protocol".to_string(), PROTOCOL_VERSION.to_string());
 
-		// local_ip_addr correctly pulls in the ip address for ios
 		let conf = ServiceInfo::new(
-			"_kdeconnect._udp.local.",
-			&self.device_id,
-			&self.device_id,
+			SERVICE,
+			&self.identity.device_id,
+			&format!("{}.local.", self.identity.device_id),
 			IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-			// local_ip_addr::get_local_ip_address()
-			// 	.map_or(vec![], |x| vec![x])
-			// 	.as_slice(),
 			KDECONNECT_PORT,
 			props,
 		)?
@@ -376,11 +343,12 @@ impl KdeConnect {
 	}
 
 	async fn discover_mdns(&self) -> Result<()> {
-		let browser = self.mdns.browse("_kdeconnect._udp.local.")?;
+		let browser = self.mdns.browse(SERVICE)?;
+
 		while let Ok(service) = browser.recv_async().await {
 			if let ServiceEvent::ServiceResolved(info) = service
 				&& let Some(id) = info.get_property_val_str("id")
-				&& id != self.device_id
+				&& id != self.identity.device_id
 				&& let Some(addr) = info.get_addresses().iter().next()
 			{
 				info!(
@@ -398,7 +366,7 @@ impl KdeConnect {
 					UdpSocket::bind(bind_addr)
 						.await?
 						.send_to(
-							&json::to_vec(&self.make_identity(Some(KDECONNECT_PORT)))?,
+							&serde_json::to_vec(&self.make_identity(Some(KDECONNECT_PORT)))?,
 							addr,
 						)
 						.await
@@ -413,6 +381,21 @@ impl KdeConnect {
 		}
 		Ok(())
 	}
+
+	async fn respond_to_client(&self) {
+		while let Some(evt) = self.client_rx.lock().await.recv().await {
+			let _ = match evt {};
+		}
+	}
+
+	fn make_identity(&self, tcp_port: Option<u16>) -> Packet {
+		let ident = self.identity.to_packet(tcp_port);
+		make_packet!(ident)
+	}
+}
+
+enum KdeConnectAction {
+	// BroadcastIdentity(oneshot::Sender<Result<()>>),
 }
 
 pub struct KdeConnectClient {
@@ -420,10 +403,10 @@ pub struct KdeConnectClient {
 }
 
 impl KdeConnectClient {
-	pub async fn broadcast_identity(&self) -> Result<()> {
-		let (tx, rx) = oneshot::channel();
-		self.client_tx
-			.send(KdeConnectAction::BroadcastIdentity(tx))?;
-		rx.await?
-	}
+	// pub async fn broadcast_identity(&self) -> Result<()> {
+	// 	let (tx, rx) = oneshot::channel();
+	// 	self.client_tx
+	// 		.send(KdeConnectAction::BroadcastIdentity(tx))?;
+	// 	rx.await?
+	// }
 }

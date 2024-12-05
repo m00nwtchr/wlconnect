@@ -1,3 +1,7 @@
+use serde::{Deserialize, Serialize};
+
+use crate::derive_type;
+
 #[derive(Serialize, Deserialize, Copy, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub enum TelephonyEvent {

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::derive_type;
 
@@ -25,7 +26,7 @@ pub struct MousepadRequest {
 	pub send_ack: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(Serialize_repr, Deserialize_repr, Copy, Clone, Debug)]
 #[repr(u8)]
 pub enum MousepadSpecialKey {
 	Backspace = 1,

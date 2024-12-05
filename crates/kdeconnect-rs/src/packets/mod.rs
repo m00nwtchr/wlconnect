@@ -25,11 +25,13 @@ pub use findmyphone::FindMyPhone;
 pub use identity::*;
 pub use mousepad::*;
 pub use mpris::*;
+pub use pair::*;
 pub use ping::Ping;
 pub use presenter::Presenter;
 pub use runcommand::*;
 pub use share::*;
 pub use systemvolume::*;
+pub use telephony::*;
 
 pub const PROTOCOL_VERSION: usize = 7;
 
@@ -121,10 +123,17 @@ pub struct Packet {
 	#[serde(rename = "type")]
 	pub packet_type: String,
 	pub body: Value,
+
+	#[serde(flatten, skip_serializing_if = "Option::is_none")]
+	pub payload: Option<PacketPayload>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PacketPayload {
 	#[serde(rename = "payloadSize")]
-	pub payload_size: Option<i64>,
+	pub size: i64,
 	#[serde(rename = "payloadTransferInfo")]
-	pub payload_transfer_info: Option<PacketPayloadTransferInfo>,
+	pub transfer_info: PacketPayloadTransferInfo,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -141,8 +150,7 @@ macro_rules! make_packet {
 			id: $crate::util::get_time_ms(),
 			packet_type: $packet.get_type_self().to_string(),
 			body: serde_json::value::to_value($packet).expect("packet was invalid"),
-			payload_size: None,
-			payload_transfer_info: None,
+			payload: None,
 		}
 	};
 }
@@ -150,13 +158,15 @@ macro_rules! make_packet {
 #[macro_export]
 macro_rules! make_packet_payload {
 	($packet:ident, $payload_size:expr, $payload_port:expr) => {
-		Packet {
+		crate::packets::Packet {
 			id: $crate::util::get_time_ms(),
 			packet_type: $packet.get_type_self().to_string(),
 			body: serde_json::value::to_value($packet).expect("packet was invalid"),
-			payload_size: Some($payload_size),
-			payload_transfer_info: Some(PacketPayloadTransferInfo {
-				port: $payload_port,
+			payload: Some(crate::packets::PacketPayload {
+				size: $payload_size,
+				transfer_info: crate::packets::PacketPayloadTransferInfo {
+					port: $payload_port,
+				},
 			}),
 		}
 	};
