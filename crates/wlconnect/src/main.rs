@@ -1,5 +1,12 @@
-use std::{collections::HashMap, path::PathBuf, pin::Pin, str::FromStr, sync::Arc};
+use std::{
+	collections::HashMap,
+	path::PathBuf,
+	pin::Pin,
+	str::FromStr,
+	sync::{Arc, Mutex},
+};
 
+use enigo::{Axis, Coordinate, Enigo, Mouse, Settings};
 use kdeconnect::{
 	config::FsConfig,
 	device::DeviceHandler,
@@ -13,7 +20,17 @@ use log::info;
 use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
 
-struct MyDeviceHandler;
+struct MyDeviceHandler {
+	enigo: Arc<Mutex<Enigo>>,
+}
+
+impl MyDeviceHandler {
+	pub fn new() -> Self {
+		Self {
+			enigo: Arc::new(Mutex::new(Enigo::new(&Settings::default()).unwrap())),
+		}
+	}
+}
 
 #[async_trait::async_trait]
 impl DeviceHandler for MyDeviceHandler {
@@ -78,7 +95,24 @@ impl DeviceHandler for MyDeviceHandler {
 		// todo!();
 	}
 	async fn handle_mousepad_request(&mut self, action: MousepadRequest) {
-		// todo!();
+		// info!("{action:?}");
+
+		let scroll = action.scroll.unwrap_or(false);
+
+		if action.dx.is_some() || action.dy.is_some() {
+			if !scroll {
+				self.enigo.lock().unwrap().move_mouse(
+					action.dx.unwrap_or(0f32) as i32,
+					action.dy.unwrap_or(0f32) as i32,
+					Coordinate::Rel,
+				);
+			} else {
+				self.enigo
+					.lock()
+					.unwrap()
+					.scroll(action.dy.unwrap_or(0f32) as i32, Axis::Vertical);
+			}
+		}
 	}
 	async fn handle_mousepad_keyboard_state(&mut self, state: MousepadKeyboardState) {
 		// todo!();
@@ -157,10 +191,12 @@ async fn main() -> anyhow::Result<()> {
 		"m00n - Laptop".to_owned(),
 		packets::DeviceType::Laptop,
 		vec![
-			packets::Battery::TYPE.to_string(),
+			// packets::Battery::TYPE.to_string(),
 			packets::MousepadRequest::TYPE.to_string(),
 		],
-		vec![kdeconnect::packets::BatteryRequest::TYPE.to_string()],
+		vec![
+			// kdeconnect::packets::BatteryRequest::TYPE.to_string()
+		],
 		config_provider.clone(),
 	)
 	.await?;
@@ -178,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
 				device.config.id, device.config.name, device.config.device_type
 			);
 
-			let handler = Box::new(MyDeviceHandler);
+			let handler = Box::new(MyDeviceHandler::new());
 
 			tokio::spawn(async move {
 				info!("handler task exited: {:?}", device.task(handler).await);
